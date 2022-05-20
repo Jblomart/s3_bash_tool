@@ -1,0 +1,952 @@
+#!/bin/bash
+programname=$(echo $0 | sed 's/.*\///')
+
+usage() {
+  echo "get help:                         $programname [--action <list|get|put|cancelmultipart|delete|test>] --help"
+  echo "generic usage:                    $programname --url http[s]://<dns name or ip address of the s3 service>[:<port>] --bucket <bucket name> --access_key <access_key> --secret_key <secret_key> [--region <region name>] [--debug][] --[proxy http[s]://<dns name or ip address of the proxy>[:<port>]] --action <list|get|put|cancelmultipart|delete|test> [...]"
+  echo "usage for list action:            $programname --url http[s]://<dns name or ip address of the s3 service>[:<port>] --bucket <bucket name> --access_key <access_key> --secret_key <secret_key> [--region <region name>] [--debug] [--proxy http[s]://<dns name or ip address of the proxy>[:<port>]] --action list"
+  echo "usage for get action:             $programname --url http[s]://<dns name or ip address of the s3 service>[:<port>] --bucket <bucket name> --access_key <access_key> --secret_key <secret_key> [--region <region name>] [--debug] [--proxy http[s]://<dns name or ip address of the proxy>[:<port>]] --action get --s3path <s3 object key>"
+  echo "usage for delete action:          $programname --url http[s]://<dns name or ip address of the s3 service>[:<port>] --bucket <bucket name> --access_key <access_key> --secret_key <secret_key> [--region <region name>] [--debug] [--proxy http[s]://<dns name or ip address of the proxy>[:<port>]] --action delete --s3path <s3 object key>"
+  echo "usage for put action:             $programname --url http[s]://<dns name or ip address of the s3 service>[:<port>] --bucket <bucket name> --access_key <access_key> --secret_key <secret_key> [--region <region name>] [--debug] [--proxy http[s]://<dns name or ip address of the proxy>[:<port>]] [--multipart] [--parallel] --action put --s3path <s3 object key> --file <local file>"
+  echo "usage for putpart action:         $programname --url http[s]://<dns name or ip address of the s3 service>[:<port>] --bucket <bucket name> --access_key <access_key> --secret_key <secret_key> [--region <region name>] [--debug] [--proxy http[s]://<dns name or ip address of the proxy>[:<port>]] --action putpart --s3path <s3 object key> --file <local file> --partnum <part number> --uploadid <uploadid>"
+  echo "usage for test action:            $programname --url http[s]://<dns name or ip address of the s3 service>[:<port>] --bucket <bucket name> --access_key <access_key> --secret_key <secret_key> [--region <region name>] [--debug] [--proxy http[s]://<dns name or ip address of the proxy>[:<port>]] [--multipart] --action test --s3path <s3 object key> --size <size in Mb>"
+  echo "usage for cancelmultipart action: $programname --url http[s]://<dns name or ip address of the s3 service>[:<port>] --bucket <bucket name> --access_key <access_key> --secret_key <secret_key> [--region <region name>] [--debug] [--proxy http[s]://<dns name or ip address of the proxy>[:<port>]] --action cancelmultipart --s3path <s3 object key> --uploadid <upload id>"
+}
+
+help() {
+  echo "$programname -- Tool to interract with S3 storage with limited dependencies (dd,awk,openssl,curl and tee)."
+  echo "------------------------------------------------------------------------------------------------------------"
+  echo "required arguments :"
+  echo "  --url         http url for the s3 service (http[s]://<dns name or ip address of the s3 service>[:<port>])."
+  echo "  --bucket      name of the bucket we will work with."
+  echo "  --access_key  s3 access key for authentication."
+  echo "  --secret_key  s3 secret key for authentication."
+  echo "  --action      action to perform, can be list,get,put,cancelmultipart,delete,test"
+  echo "optional arguments :"
+  echo "  --region      region where the bucket is hosted, defaults to us-west-1."
+  echo "  --proxy       proxy to use when sending request to the s3 url."
+  echo "  --debug       show debug information."    
+  echo
+  echo "actions arguments :"
+  if [ "$AWS_ACTION" == "get" ] || [ "$AWS_ACTION" == "" ]
+  then
+    echo "  \"get\" action : outputs the object content."
+    echo "  required arguments :"
+    echo "    --s3path    path of the object in S3 (aka object key)."
+    echo
+  fi
+  if [ "$AWS_ACTION" == "list" ] || [ "$AWS_ACTION" == "" ]
+  then
+    echo "  \"list\" action : show bucket content (simple xml format)."
+    echo "  no required arguments."
+    echo
+  fi
+  if [ "$AWS_ACTION" == "put" ] || [ "$AWS_ACTION" == "" ]
+  then
+    echo "  \"put\" action : upload file content to s3 object."
+    echo "  required arguments :"
+    echo "    --s3path    path of the object in S3 (aka object key)."
+    echo "    --file      path of local file to upload to the object."
+    echo "  optional arguments :"
+    echo "    --mulipart  use multipart to upload the file content."
+    echo "    --parallel  use parallel multipart uploads"
+    echo
+  fi
+  if [ "$AWS_ACTION" == "putpart" ] || [ "$AWS_ACTION" == "" ]
+  then
+    echo "  \"putpart\" action : upload part file content to s3 object for a multipart upload."
+    echo "  required arguments :"
+    echo "    --s3path    path of the object in S3 (aka object key)."
+    echo "    --file      path of local file to upload to the object."
+    echo "    --partnum   number of the part"
+    echo "    --uploadid  identifier of the multipart upload"
+    echo "  optional arguments :"
+    echo "    --mulipart  use multipart to upload the file content."
+    echo
+  fi
+  if [ "$AWS_ACTION" == "cancelmultipart" ] || [ "$AWS_ACTION" == "" ]
+  then
+    echo "  \"cancelmultipart\" action : cancels a multipart upload that is not completed."
+    echo "  required arguments :"
+    echo "    --s3path    path of the object in S3 (aka object key)."
+    echo "    --uploadid  Identifier of the multipart upload."
+    echo
+  fi
+  if [ "$AWS_ACTION" == "delete" ] || [ "$AWS_ACTION" == "" ]
+  then
+    echo "  \"delete\" action : deletes an s3 bucket object."
+    echo "  required arguments :"
+    echo "    --s3path    path of the object in S3 (aka object key)."
+    echo
+  fi
+  if [ "$AWS_ACTION" == "test" ] || [ "$AWS_ACTION" == "" ]
+  then
+    echo "  \"test\" action : test creation and deletion of an s3 object."
+    echo "  required arguments :"
+    echo "    --s3path    path of the object in S3 (aka object key)."
+    echo "    --size      size of the file to upload in Mb (will be generated automatically)."
+    echo "  optional arguments :"
+    echo "    --mulipart  use multipart to upload the file content."
+  fi
+}
+
+##### Global vars #####
+HELP=0
+AWS_ACCESS_KEY=""
+AWS_SECRET_KEY=""
+AWS_REGION=""
+AWS_URL=""
+UPLOADID=""
+ETAG=""
+ITEM=""
+PARTSINFO=""
+PARTNUM=""
+DEBUG=0
+MULTIPART=0
+PARALLEL=0
+TIMEOUT=60
+PROXY=""
+CURL_FORMAT="\n\nCurl_outputs:\n=============\n\nhttp_response_code:  %{http_code}\n----------\nbytes_downloaded:  %{size_download}\nbytes_uploaded:  %{size_upload}\nspeed_download:  %{speed_download}\nspeed_upload:  %{speed_upload}\n----------\ntime_namelookup:  %{time_namelookup}s\ntime_connect:  %{time_connect}s\ntime_appconnect:  %{time_appconnect}s\ntime_pretransfer:  %{time_pretransfer}s\ntime_redirect:  %{time_redirect}s\ntime_starttransfer:  %{time_starttransfer}s\n----------\ntime_total:  %{time_total}s\n"
+
+##### Helper Functions #####
+
+# Fail with message
+fail() {
+  echo "$1" > /dev/stderr
+  exit 1
+}
+
+echo_step() {
+  echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') ##############################################################"
+  echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') # $1"
+  echo "$(date -u +'%Y-%m-%dT%H:%M:%SZ') ##############################################################"
+  echo
+}
+
+# Create hmac sha256
+# $1 key
+# $2 data
+hmac_sha256() {
+  key="$1"
+  data="$2"
+  printf "$data" | openssl dgst -sha256 -mac HMAC -macopt "$key" | sed 's/^.* //'
+}
+
+# Create sha256
+# $1 data
+sha256() {
+  printf $1 | openssl dgst -sha256 | sed 's/.* //'
+}
+
+# Create sha256 of file
+# $1 file path
+sha256file() {
+  openssl dgst -sha256 $1 | sed 's/.* //'
+}
+
+# create signing key
+# $1 secret key
+# $2 date
+# $3 region
+# $4 service
+signingkey() {
+  secret="$1"
+  date="$2"
+  region="$3"
+  service="$4"
+  dateKey=$(hmac_sha256 key:"AWS4$secret" $date)
+  dateRegionKey=$(hmac_sha256 hexkey:$dateKey $region)
+  dateRegionServiceKey=$(hmac_sha256 hexkey:$dateRegionKey $service)
+  signingKey=$(hmac_sha256 hexkey:$dateRegionServiceKey "aws4_request")
+  echo $signingKey
+}
+
+# strip url and only keep host and port
+# uses global var AWS_URL
+getqueryhost() {
+  echo $AWS_URL | sed 's/https:\/\///;s/http:\/\///;s/\/.*//;s/\?.*//'
+}
+
+# create canonical request
+# $1 method
+# $2 uri
+# $3 querystring -- see to split & one per line
+# $4 date in iso format
+# $5 content hash
+canonicalrequest() {
+  method="$1"
+  uri="$2"
+  querystring="$3"
+  isodate="$4"
+  contenthash="$5"
+  queryhost=$(getqueryhost)
+  canonreq="${method}\n${uri}\n${querystring}\nhost:${queryhost}\nx-amz-content-sha256:${contenthash}\nx-amz-date:${isodate}\n\nhost;x-amz-content-sha256;x-amz-date\n$contenthash"
+  echo $canonreq
+}
+
+# hash canonical request
+canonreqhash() {
+  sha256 $(canonicalrequest "$1" "$2" "$3" "$4" "$5")
+}
+
+# create string to sign
+# $1 date
+# $2 hash of canon req
+# $3 date in iso format
+# $4 region
+# $5 servicce
+stringtosign() {
+  date="$1"
+  hash="$2"
+  isodate="$3"
+  region="$4"
+  service="$5"
+  strtosign="AWS4-HMAC-SHA256\n${isodate}\n${date}/${region}/${service}/aws4_request\n${hash}"
+  echo $strtosign
+}
+
+# perform signed request
+# $1 region defaults to us-west-1 if empty string
+# $2 service defaults to s3 if empty string
+# $3 http method
+# $4 uri
+# $5 query string
+# $6 post payload
+# $7 multipart initial file sha256 checksum
+signedreq() {
+    # options always used : do not validate certs and timeout after one minute
+    CURL_OPTS="--max-time $TIMEOUT -k"
+
+    # input parameters parsing
+    region="$1"
+    if [ "$region" == "" ]
+    then
+      region="us-west-1"
+    fi
+    service="$2"
+    if [ "$service" == "" ]
+    then
+      service="s3"
+    fi
+    method="$3"
+    uri="$4"
+    querystring="$5"
+    if [[ "$querystring" == *\&* ]]
+    then
+      #create querystring for canonical request
+      #replace & with \n
+      #sort lines alphabetically 
+      cquerystring=$querystring
+      cquerystring=$(echo $cquerystring | sed 's/&/\\n/g;s/%/%%/g')
+      cquerystring=$(printf $cquerystring | sort | awk '{printf "%s\\n", $0}' | sed 's/\\n$//')
+    else
+      cquerystring=$querystring
+    fi
+    payload="$6"
+    sha256checksum="$7"
+
+    # if no upload give empty string sha256 hash or calculate hash and do the file upload with -T option
+    payloadhash="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    if [ "$payload" != "" ]
+    then
+      payloadhash=$(sha256file ${payload})
+      CURL_OPTS="$CURL_OPTS -T ${payload}"
+      if [ "$DEBUG" == "1" ]
+      then
+        echo "#### Begin payload hash #####"
+        echo $payloadhash
+        echo "#### End payload hash #####"
+        echo
+      fi
+    fi
+
+    # dates used for signing the requesrt
+    date=$(date -u +'%Y%m%d')
+    isodate=$(date -u +'%Y-%m-%dT%H:%M:00Z' | sed 's/[:-]//g')
+
+    # create canonical request, canonical request hash, string to sign, signing key and signature
+    creq=$(canonicalrequest "${method}" "${uri}" "${cquerystring}" "${isodate}" "${payloadhash}")
+    if [ "$DEBUG" == "1" ]
+    then
+      echo "#### Begin Canonical request #####"
+      echo -e $creq
+      echo "#### End Canonical request #####"
+      echo
+    fi
+    reqhash=$(canonreqhash "${method}" "${uri}" "${querystring}" "${isodate}" "${payloadhash}")
+    if [ "$DEBUG" == "1" ]
+    then
+      echo "##### Begin Canonical request hash #####"
+      echo $reqhash
+      echo "##### End Canonical request hash #####"
+      echo
+    fi
+
+    strtosign=$(stringtosign "${date}" "${reqhash}" "${isodate}" "${region}" "${service}")
+    if [ "$DEBUG" == "1" ]
+    then
+      echo "##### Begin String to Sign #####"
+      echo -e $strtosign
+      echo "##### End String to Sign #####"
+      echo
+    fi
+
+    signingkey=$(signingkey "$AWS_SECRET_KEY" "${date}" "${region}" "${service}")
+    if [ "$DEBUG" == "1" ]
+    then
+      echo "##### Begin Signing Key #####"
+      echo $signingkey
+      echo "##### End Signing Key #####"
+      echo
+    fi
+
+    signature=$(hmac_sha256 hexkey:${signingkey} ${strtosign})
+    if [ "$DEBUG" == "1" ]
+    then
+      echo "##### Begin Signature #####"
+      echo $signature
+      echo "##### End Signature #####"
+      echo
+    fi
+
+    # prepend ? to querystring
+    if [ "${querystring}" != "" ]
+    then
+      querystring="?${querystring}"
+    fi
+
+    # create temp file for stdout+stderr and temp file to store response headers and output content
+    tempfile=$(mktemp)
+    headerfile=$(mktemp)
+    outputfile=$(mktemp)
+
+    # if debug : show commands
+    if [ "$DEBUG" == "1" ]
+    then
+      echo "##### Begin Curl Call #####"
+      set -x
+      CURL_OPTS="$CURL_OPTS -vv"
+    fi
+
+    # perform the actual curl call and tee to temp file
+    curl $CURL_OPTS \
+      -x "$PROXY" \
+      -o $outputfile \
+      -D $headerfile \
+      -w "$CURL_FORMAT" \
+      -H "Connection: close" \
+      -H "x-amz-checksum-sha256: ${sha256checksum}" \
+      -H "x-amz-date: ${isodate}" \
+      -H "x-amz-content-sha256: ${payloadhash}" \
+      -H "Authorization: AWS4-HMAC-SHA256 Credential=${AWS_ACCESS_KEY}/${date}/${region}/${service}/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=${signature}" \
+      -X ${method} \
+      "${AWS_URL}${uri}${querystring}" 2>&1 | tee ${tempfile}
+
+    # clean dbebug
+    if [ "$DEBUG" == "1" ]
+    then
+      set +x
+      echo "##### End Curl Call #####"
+      echo
+      if [ "${method}" != "GET" ] && [ -s $outputfile ]
+      then
+        echo "##### Begin curl call output #####"
+        xmllint $outputfile --format
+        echo "##### End curl call output #####"
+        echo
+      fi
+    fi
+
+    # show the output if listing bucket content or getting object content
+    if [ "${method}" == "GET" ] 
+    then
+      if [ "${uri}" == "/$AWS_BUCKET" ] || [ "${uri}" == "/$AWS_BUCKET/" ]
+      then
+        echo "##### Begin curl call output #####"
+        xmllint $outputfile --format
+        echo "##### End curl call output #####"
+        echo
+      else
+        echo "##### Begin curl call output #####"
+        cat $outputfile
+        echo "##### End curl call output #####"
+        echo
+      fi
+    fi
+
+    # post processing : if we started a multipart upload then get the upload identifier
+    if [ "$MULTIPART" == "1" ] && [ "${querystring}" == "?uploads=" ]
+    then
+      UPLOADID="$(cat ${outputfile} | grep InitiateMultipartUploadResult | sed 's/.*<UploadId>//;s/<\/UploadId>.*//')"
+      if [ "$DEBUG" == "1" ]
+      then
+        echo
+        echo "##### Begin Upload Id #####"
+        echo $UPLOADID
+        echo "##### End Upload Id #####"
+        echo
+      fi
+    fi
+
+    rm -f ${outputfile}
+
+    # post processing : if we uploaded a prat file of a multipart then save the output ETag from response headers
+    if [ "$MULTIPART" == "1" ] || [ "$AWS_ACTION" == "putpart" ] 
+    then
+      if [[ "${querystring}" == ?partNumber=* ]]
+      then
+        ETAG="$(cat ${headerfile} | grep ETag | sed 's/.*ETag: \"//;s/\".*//')"
+        if [ "$DEBUG" == "1" ]
+        then
+          echo "##### Begin Part ETag #####"
+          echo $ETAG
+          echo "##### End Part ETag #####"
+          echo
+        fi
+      fi
+    fi
+
+    # save http response code to use it for function return
+    ret=$(cat ${tempfile} | grep "http_response_code:" | awk '{print $2}')
+
+    # clean temp files
+    rm -f ${tempfile}
+    rm -f ${headerfile}
+
+    # return 0 with http status codes 200-399
+    if [ $ret -ge 200 ] && [ $ret -le 399 ]
+    then
+      return 0
+    else
+      if [ $ret -eq 404 ]
+      then 
+        return 2
+      else
+        return 1
+      fi
+    fi
+}
+
+# perform multipart upload
+# uses global vars PAYLOADFILE AWS_BUCKET IN_PATH
+multipartupload() {
+  # save the checksum of the initial file to check consistency after multipart parts upload.
+  filechecksum=$(sha256file $PAYLOADFILE)
+  # start a multipart upload (querystring == uploads=)
+  echo_step "Starting Multipart upload"
+  signedreq "${AWS_REGION}" "" "POST" "/${AWS_BUCKET}/${IN_PATH}" "uploads="
+  # if we have an upload id then it succeeded
+  if [ "$UPLOADID" != "" ]
+  then
+    # split the initial file into chunks of 8Mb (default to multipart)
+    echo_step "Splitting input file to multiple chunks (upload id ${UPLOADID})"
+    split -b8M $PAYLOADFILE ${PAYLOADFILE}.
+    if [ "$DEBUG" == "1" ]
+    then
+      echo "##### Begin Spliting payload file in 8Mb chunks #####"
+      echo $(ls ${PAYLOADFILE}.*)
+      echo "##### END Spliting payload file in 8Mb chunks #####"
+      echo
+    fi
+    
+    # for each chunks then upload it and save output etag and part num. Cancel upload if fails.
+    i=0
+    for f in $(ls ${PAYLOADFILE}.*)
+    do
+      i=$(expr $i + 1)
+      ETAG=""
+      if [ "$DEBUG" == "1" ]
+      then
+        echo "##### Begin part file to upload details #####"
+        ls -ltrah $f
+        echo "##### End part file to upload details #####"
+        echo
+      fi
+      echo_step "Uploading part file ${f} (upload id ${UPLOADID})"
+      if [ $PARALLEL -eq 0 ]
+      then
+        signedreq "${AWS_REGION}" "" "PUT" "/${AWS_BUCKET}/${IN_PATH}" "partNumber=${i}&uploadId=${UPLOADID}" "$f"
+        partret=$?
+        if [ $partret -ne 0 ]
+        then
+          # clean up all the part files
+          rm -f ${PAYLOADFILE}.*
+          return 1
+        fi
+        PARTSINFO="${PARTSINFO} ${i}:${ETAG}"
+      else
+        cmd_opt=""
+        if [ "${AWS_REGION}" != "" ]
+        then
+          cmd_opt="--region ${AWS_REGION}"
+        fi 
+        if [ "$DEBUG" == "1" ]
+        then
+          cmd_opt="$cmd_opt --debug"
+        fi
+        cmd="./${programname} ${cmd_opt} --access_key ${AWS_ACCESS_KEY} --secret_key ${AWS_SECRET_KEY} --url ${AWS_URL} --bucket ${AWS_BUCKET} --action putpart --partnum ${i} --uploadid ${UPLOADID} --file ${f} --s3path ${IN_PATH}"
+        if [ "$DEBUG" == "1" ]
+        then
+          echo "##### Begin Start upload part #####"
+          echo "Sarting process in background"
+          echo "Command : $cmd"
+          echo "##### End Start upload part #####"
+          echo
+        fi
+        $cmd > upload_${f}.log 2>&1 &
+      fi
+    done
+    if [ $PARALLEL -eq 1 ]
+    then
+      echo_step "Waiting for parallel parts upload to finish (upload id ${UPLOADID})"
+      filescount=$i
+      failures=0
+      wait_count=120
+      while [ $wait_count -gt 0 ]
+      do
+        for f in $(ls ${PAYLOADFILE}.*)
+        do
+          if [ -f success_${f} ]
+          then
+            PARTSINFO="${PARTSINFO} $(cat success_${f})"
+            rm -f success_${f}
+            cat upload_${f}.log
+            rm -f upload_${f}.log
+            echo
+            filescount=$(expr ${filescount} - 1)
+            if [ "${DEBUG}" == "1" ]
+            then
+              echo "##### Begin End upload part #####"
+              echo "Upload of file ${f} succeeded"
+              echo "##### End End upload part #####"
+              echo
+            fi
+          fi
+          if [ -f failure_${f} ]
+          then
+            rm -f failure_${f}
+            cat upload_${f}.log
+            rm -f upload_${f}.log
+            echo
+            filescount=$(expr ${filescount} - 1)
+            failures=$(expr ${failures} + 1)
+            if [ "${DEBUG}" == "1" ]
+            then
+              echo "##### Begin End upload part #####"
+              echo "Upload of file ${f} failed"
+              echo "##### End End upload part #####"
+              echo
+            fi
+          fi
+        done
+        if [ $filescount -gt 0 ]
+        then
+          if [ $wait_count -gt 0 ]
+          then
+            if [ "$DEBUG" == "1" ]
+            then
+              echo "##### Begin Wait Loop #####"
+              echo "Files to upload : ${filescount} Failures : ${failures} Counter : ${wait_count} -- Sleeping 1 second"
+              echo "##### End Wait Loop #####"
+            fi
+            wait_count=$(expr ${wait_count} - 1)
+            sleep 1
+          else
+            if [ "$DEBUG" == "1" ]
+            then
+              echo "##### Begin Parts upload timed out #####"
+              echo "Cancelling multipart upload"
+              echo "##### End Parts upload timed out #####"
+              echo
+            fi
+            # clean up all the part files
+            rm -f ${PAYLOADFILE}.*
+            return 2
+          fi
+        else
+          # clean up all the part files
+          rm -f ${PAYLOADFILE}.*
+          if [ $failures -gt 0 ]
+          then
+            return 3
+          fi
+          break
+        fi
+      done
+    fi
+    
+    # create xml payload to complete the multipart upload
+    temppayloadfile=$(mktemp)
+    echo "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" > $temppayloadfile
+    echo "<CompleteMultipartUpload xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">" >> $temppayloadfile
+    for p in $PARTSINFO
+    do
+      parnum=$(echo $p | cut -f 1 -d ":")
+      etag=$(echo $p | cut -f 2 -d ":")
+      echo "   <Part>" >> $temppayloadfile
+      echo "      <ETag>${etag}</ETag>" >> $temppayloadfile
+      echo "      <PartNumber>${parnum}</PartNumber>" >> $temppayloadfile
+      echo "   </Part>" >> $temppayloadfile
+    done
+    echo "</CompleteMultipartUpload>" >> $temppayloadfile
+    if [ "$DEBUG" == "1" ]
+    then
+      echo "##### Begin XML payload #####"
+      cat $temppayloadfile
+      echo "##### End XML payload #####"
+      echo
+    fi
+    # send the complete multipart upload request
+
+    echo_step "Completing multipart upload (upload id ${UPLOADID})"
+    signedreq "${AWS_REGION}" "" "POST" "/${AWS_BUCKET}/${IN_PATH}" "uploadId=${UPLOADID}" "${temppayloadfile}" "${filechecksum}"
+    completeret=$?
+    rm -f ${temppayloadfile}
+    # if the request failed then cancel the whole multipart upload
+    if [ $completeret -ne 0 ]
+    then
+      return 4
+    fi
+  fi
+  return 0
+}
+
+checkexistinglocks() {
+  # check if file exists 
+  echo_step "Checking if object ${IN_PATH} exists in bucket ${AWS_BUCKET}"
+  signedreq "${AWS_REGION}" "" "HEAD" "/${AWS_BUCKET}/${IN_PATH}"
+  if [ $? -eq 0 ]
+  then
+    if [ "$DEBUG" == "1" ]
+    then
+      echo "##### Begin object exist check #####"
+      echo "object ${IN_PATH} exists in bucket ${AWS_BUCKET}."
+      echo "##### End object exist check #####"
+      echo
+    fi
+    echo_step "Checking if object ${IN_PATH} in bucket ${AWS_BUCKET} is locked"
+    signedreq "${AWS_REGION}" "" "GET" "/${AWS_BUCKET}/" "object-lock="
+    if [ $? -eq 2 ]
+    then 
+      if [ "$DEBUG" == "1" ]
+      then
+        echo "##### Begin object locks check #####"
+        echo "object ${IN_PATH} in bucket ${AWS_BUCKET} is not locked."
+        echo "##### End object locks check #####"
+        echo
+      fi
+      return 0
+    else
+      fail "object ${IN_PATH} in bucket ${AWS_BUCKET} is locked."
+    fi
+  fi
+}
+##### Fail if we do not have curl or openssl #####
+
+#dependency check
+if ! hash awk 2>/dev/null; then fail "dd not installed"; fi
+if ! hash dd 2>/dev/null; then fail "dd not installed"; fi
+if ! hash tee 2>/dev/null; then fail "tee not installed"; fi
+if ! hash openssl 2>/dev/null; then fail "openssl not installed"; fi
+if ! hash curl 2>/dev/null; then fail "curl not installed"; fi
+
+##### Parse arguments #####
+
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --help)
+      HELP=1
+      shift # past argument
+      ;;
+    --access_key)
+      AWS_ACCESS_KEY="$2"
+      shift # past argument
+      shift # past value
+      ;;
+    --secret_key)
+      AWS_SECRET_KEY="$2"
+      shift # past argument
+      shift # past value
+      ;;
+    --url)
+      AWS_URL="$2"
+      shift # past argument
+      shift # past value
+      ;;
+    --region)
+      AWS_REGION="$2"
+      shift # past argument
+      shift # past value
+      ;;
+    --action)
+      AWS_ACTION="$2"
+      shift # past argument
+      shift # past value
+      ;;
+    --bucket)
+      AWS_BUCKET="$2"
+      shift # past argument
+      shift # past value
+      ;;
+    --s3path)
+      IN_PATH="$2"
+      shift # past argument
+      shift # past value
+      ;;
+    --file)
+      PAYLOADFILE="$2"
+      shift # past argument
+      shift # past value
+      ;;
+    --debug)
+      DEBUG=1
+      shift # past argument
+      ;;
+    --size)
+      SIZE="$2"
+      shift # past argument
+      shift # past value
+      ;;
+    --timeout)
+      TIMEOUT="$2"
+      shift # past argument
+      shift # past value
+      ;;
+    --uploadid)
+      UPLOADID="$2"
+      shift # past argument
+      shift # past value
+      ;;
+    --partnum)
+      PARTNUM="$2"
+      shift # past argument
+      shift # past value
+      ;;
+    --parallel)
+      PARALLEL=1
+      shift # past argument
+      ;;
+    --proxy)
+      PROXY="$2"
+      shift # past argument
+      shift # past value
+      ;;
+    --multipart)
+      MULTIPART=1
+      shift # past argument
+      ;;
+    -*|--*)
+      echo "Unknown option $1"
+      usage
+      echo
+      help
+      exit 1
+      ;;
+    *)
+      shift # past argument
+      ;;
+  esac
+done
+
+##### Fail if no secret key / access key and url #####
+if [ "$HELP" == "1" ]
+then
+   help
+   exit 0
+fi
+
+if [ "$AWS_BUCKET" == "" ]
+then
+  usage
+  fail "No S3 bucket provided , aborting."
+fi
+if [ "$AWS_SECRET_KEY" == "" ]
+then
+  usage
+  fail "No S3 secret key provided , aborting."
+fi
+if [ "$AWS_ACCESS_KEY" == "" ]
+then
+  usage
+  fail "No S3 access key provided , aborting."
+fi
+if [ "$AWS_URL" == "" ]
+then
+  usage
+  fail "No S3 Url provided, aborting."
+fi
+if [ "$AWS_ACTION" == "" ]
+then
+  usage
+  fail "No action provided, aborting."
+fi
+
+##### Script S3 actions #####
+
+##### Action get content #####
+if [ "$AWS_ACTION" == "get" ]
+then
+  if [ "$IN_PATH" == "" ]
+  then
+    usage
+    fail "S3 get operation : No file specified"
+  fi
+  signedreq "${AWS_REGION}" "" "GET" "/${AWS_BUCKET}/${IN_PATH}"
+fi
+
+##### Action list bucket content #####
+if [ "$AWS_ACTION" == "list" ]
+then
+  echo_step "Listing bucket ${AWS_BUCKET} content"
+  signedreq "${AWS_REGION}" "" "GET" "/${AWS_BUCKET}"
+fi
+
+##### Action upload #####
+if [ "$AWS_ACTION" == "put" ]
+then
+  if [ "$IN_PATH" == "" ]
+  then
+    usage
+    fail "S3 put operation : No destination specified"
+  fi
+  if [ "$PAYLOADFILE" == "" ]
+  then
+    usage
+    fail "s3 put operation : No payload to upload"
+  fi
+  checkexistinglocks
+  if [ "$MULTIPART" == "1" ]
+  then
+    echo_step "Upload ${PAYLOADFILE} with multipart"
+    multipartupload
+  else
+    echo_step "Upload ${PAYLOADFILE} directly"
+    signedreq "${AWS_REGION}" "" "PUT" "/${AWS_BUCKET}/${IN_PATH}" "" "$PAYLOADFILE"
+  fi
+fi
+
+##### Action upload part file #####
+if [ "$AWS_ACTION" == "putpart" ]
+then
+  if [ "$IN_PATH" == "" ]
+  then
+    usage
+    fail "S3 put part operation : No destination specified"
+  fi
+  if [ "$PAYLOADFILE" == "" ]
+  then
+    usage
+    fail "s3 put part operation : No payload to upload"
+  fi
+  if [ "$UPLOADID" == "" ]
+  then
+    usage
+    fail "s3 put part operation : No upload id"
+  fi
+  if [ "$PARTNUM" == "" ]
+  then
+    usage
+    fail "s3 put part operation : no part number"
+  fi
+  echo_step "Upload Part ${PAYLOADFILE} number ${PARTNUM} upload id ${UPLOADID}"
+  signedreq "${AWS_REGION}" "" "PUT" "/${AWS_BUCKET}/${IN_PATH}" "partNumber=${PARTNUM}&uploadId=${UPLOADID}" "$PAYLOADFILE"
+  if [ $? -eq 0 ]
+  then
+    echo ${PARTNUM}:${ETAG} > success_${PAYLOADFILE}
+    if [ "${DEBUG}" == "1" ]
+    then
+      echo "##### Begin End of part upload #####"
+      echo "Writing success marker"
+      echo "##### End End of part upload #####"
+    fi
+  else
+    touch failure_${PAYLOADFILE}
+    if [ "${DEBUG}" == "1" ]
+    then
+      echo "##### Begin End of part upload #####"
+      echo "Writing failure marker"
+      echo "##### End End of part upload #####"
+    fi
+  fi
+fi
+
+##### Action cancel upload #####
+if [ "$AWS_ACTION" == "cancelmultipart" ]
+then
+  if [ "$IN_PATH" == "" ]
+  then
+    usage
+    fail "S3 cancel multipart upload operation : No destination specified"
+  fi
+  if [ "$UPLOADID" == "" ]
+  then
+    usage
+    fail "S3 cancel multipart upload operation : No upload id provided"
+  fi
+  echo_step "Cancelling multipart upload with id ${UPLOADID}"
+  signedreq "${AWS_REGION}" "" "DELETE" "/${AWS_BUCKET}/${IN_PATH}" "uploadId=${UPLOADID}"
+fi
+
+##### Action delete #####
+if [ "$AWS_ACTION" == "delete" ]
+then
+  if [ "$IN_PATH" == "" ]
+  then
+    usage
+    fail "S3 get operation : No s3 object specified"
+  fi
+  checkexistinglocks
+  echo_step "Deleting ${IN_PATH} from ${AWS_BUCKET} bucket."
+  signedreq "${AWS_REGION}" "" "DELETE" "/${AWS_BUCKET}/${IN_PATH}"
+fi
+
+#### Action test perf #####
+if [ "$AWS_ACTION" == "test" ]
+then
+  if [ "$AWS_BUCKET" == "" ]
+  then
+    uage
+    fail "S3 test opreation : No bucket specified"
+  fi
+  if [ "$IN_PATH" == "" ]
+  then
+    usage
+    fail "S3 test operation : No destination specified"
+  fi
+  if [ "$SIZE" == "" ]
+  then
+    usage
+    fail "s3 test operation : No file size given (in Mb)"
+  fi
+  startms=$(date +%s%3N)
+  result=0
+  checkexistinglocks
+  echo_step "Creating ${SIZE}Mb File"
+  dd if=/dev/zero of=testfile.bin bs=1024 count=0 seek=$[1024*${SIZE}]
+  PAYLOADFILE="testfile.bin"
+  if [ "$MULTIPART" == "1" ]
+  then
+    echo_step "Upload ${PAYLOADFILE} with multipart"
+    multipartupload
+    if [ $? -ne 0 ]
+    then
+      result=1
+      echo_step "Cancelling multipart upload with id ${UPLOADID}"
+      signedreq "${AWS_REGION}" "" "DELETE" "/${AWS_BUCKET}/${IN_PATH}" "uploadId=${UPLOADID}"
+    fi
+  else
+    echo_step "Upload ${PAYLOADFILE} directly"
+    signedreq "${AWS_REGION}" "" "PUT" "/${AWS_BUCKET}/${IN_PATH}" "" "testfile.bin"
+    result=$?
+  fi
+  echo_step "Deleting ${IN_PATH} from ${AWS_BUCKET} bucket"
+  signedreq "${AWS_REGION}" "" "DELETE" "/${AWS_BUCKET}/${IN_PATH}"
+  rm -f testfile.bin
+  endms=$(date +%s%3N)
+  timems=$(expr ${endms} - ${startms})
+  if [ $result -gt 0 ]
+  then
+    fail "s3 test operation : File upload failed ! Time taken : $timems miliseconds."
+  fi
+  echo_step "Finished : upload of file of size ${SIZE} Mb to bucket ${AWS_BUCKET}/${IN_PATH} took $timems miliseconds."
+fi
